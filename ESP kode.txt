@@ -1,0 +1,197 @@
+from umqttrobust import MQTTClient
+import network
+import time
+import dht
+import machine
+from machine import SoftI2C, Pin,ADC
+import time
+import _thread
+# WiFi credentials
+wifi_ssid = 'TP-Link_AA22'
+wifi_password = '69168062'
+
+# MQTT Broker details
+mqtt_broker_ip = '10.10.10.10'
+client_id = 'ESP32_Client'
+
+fall_count = 0
+
+# Initialize the DHT11 sensor
+sensor = dht.DHT11(machine.Pin(21))
+
+analog_pin = ADC(Pin(34))
+analog_pin.atten(ADC.ATTN_11DB)
+analog_pin.width(ADC.WIDTH_12BIT)
+
+g = Pin(2, Pin.OUT,value=0)
+grøn = Pin(5, Pin.OUT,value=0)
+b = Pin(4, Pin.OUT,value=0)
+
+def batteri():
+    while True:
+        analog_val = analog_pin.read()
+        volts = (analog_val * 0.00085238)*5
+        battery_percentage = volts*50 - 320
+        print("the battery percentage is:", battery_percentage, "%")
+        sleep(1)
+        
+        if battery_percentage > 70:
+            grøn.value(1)
+        if battery_percentage < 70 and battery_percentage > 30:
+            b.value(1)
+        if battery_percentage < 30:
+            g.value(1)
+
+# Connect to WiFi
+def connect_to_wifi():
+    station = network.WLAN(network.STA_IF)
+    station.active(True)
+    station.connect(wifi_ssid, wifi_password)
+
+    while not station.isconnected():
+        pass
+
+    print('Connected to WiFi')
+
+# Setup MQTT Client
+def setup_mqtt_client():
+    client = MQTTClient(client_id, mqtt_broker_ip)
+    try:
+        client.connect()
+        print('Connected to MQTT Broker')
+    except Exception as e:
+        print('Failed to connect to MQTT Broker. Error:', e)
+        return None
+
+    return client
+
+#IMU KODE
+
+# MPU6050 Registers and their Address
+PWR_MGMT_1   = 0x6B
+SMPLRT_DIV   = 0x19
+CONFIG       = 0x1A
+GYRO_CONFIG  = 0x1B
+INT_ENABLE   = 0x38
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
+
+
+# I2C bus setup
+bus = SoftI2C(scl=Pin(26), sda=Pin(27), freq=400000)
+Device_Address = 0x68   # MPU6050 device address
+
+# MPU6050 setup function
+def MPU_Init():
+    # write to sample rate register
+    bus.writeto_mem(Device_Address, SMPLRT_DIV, b'\x07')
+    
+    # Write to power management register
+    bus.writeto_mem(Device_Address, PWR_MGMT_1, b'\x01')
+    
+    # Write to Configuration register
+    bus.writeto_mem(Device_Address, CONFIG, b'\x00')
+    
+    # Write to Gyro configuration register
+    bus.writeto_mem(Device_Address, GYRO_CONFIG, b'\x18')
+    
+    # Write to interrupt enable register
+    bus.writeto_mem(Device_Address, INT_ENABLE, b'\x01')
+
+# Function to read raw data from the accelerometer
+def read_raw_data(addr):
+    # Accelero and Gyro value are 16-bit
+    high = bus.readfrom_mem(Device_Address, addr, 1)
+    low = bus.readfrom_mem(Device_Address, addr+1, 1)
+    
+    # concatenate higher and lower value
+    value = high[0] << 8 | low[0]
+    
+    # to get signed value from mpu6050
+    if(value > 32768):
+        value = value - 65536
+    return value
+
+
+MPU_Init()
+
+print("Reading Data of Gyroscope and Accelerometer")
+
+# Adjusted threshold for fall detection
+fall_threshold = 1.5  # Acceleration in g's (this can be adjusted based on sensitivity required)
+
+# Debounce counter
+debounce_count = 0
+debounce_limit = 2  # Number of consecutive readings to confirm a fall
+
+def imukode():
+    global fall_count
+    if client:
+        fall_topic = 'sensor/fall'
+        while True:
+            # Read Accelerometer raw value
+            acc_x = read_raw_data(ACCEL_XOUT_H)
+            acc_y = read_raw_data(ACCEL_YOUT_H)
+            acc_z = read_raw_data(ACCEL_ZOUT_H)
+
+            # Convert to acceleration in g's
+            Ax = acc_x / 16384.0
+            Ay = acc_y / 16384.0
+            Az = acc_z / 16384.0
+
+            # Fall detection logic with debounce
+            if abs(Ax) > fall_threshold or abs(Ay) > fall_threshold or abs(Az) > fall_threshold:
+                debounce_count += 1
+                if debounce_count >= debounce_limit:
+                    print("Fall detected")
+                    debounce_count = 0
+                    fall_count = fall_count +1
+                    print(fall_count)
+                    client.publish(fall_topic, str(fall_count))
+                    print(f'Published fall_count: {fall_count} to {fall_topic}')
+
+                    time.sleep(2)  # Delay to avoid multiple messages for the same fall
+            else:
+                debounce_count = 0
+
+            time.sleep(0.1)
+
+# Main function
+def main():
+
+
+    if client:
+        temp_topic = 'sensor/temperature'
+        hum_topic = 'sensor/humidity'
+
+        # Publish sensor data
+        while True:
+            try:
+                sensor.measure()
+                temp = sensor.temperature()  # Temperature in Celsius
+                hum = sensor.humidity() # Humidity in percent
+                
+
+                client.publish(temp_topic, str(temp))
+                client.publish(hum_topic, str(hum))
+                
+                print(f'Published Temperature: {temp}°C to {temp_topic}')
+                print(f'Published Humidity: {hum}% to {hum_topic}')
+            except OSError as e:
+                print('Failed to read sensor:', e)
+
+            time.sleep(2)  # Delay for 2 seconds
+
+    else:
+        print('Could not establish MQTT connection')
+connect_to_wifi()
+client = setup_mqtt_client()        
+_thread.start_new_thread(imukode, ())
+_thread.start_new_thread(batteri, ())
+main()
+
+
+
+
+
